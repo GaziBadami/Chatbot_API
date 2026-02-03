@@ -1,0 +1,11 @@
+# List of libraries to install
+
+fastapi
+uvicorn
+mysql-connector-python
+groq
+python-dotenv
+pip install python-multipart
+pip install pymupdf
+pip install python-docx Spire.Doc
+pip install groq fastapi uvicorn mysql-connector-python python-dotenv
