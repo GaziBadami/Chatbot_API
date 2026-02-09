@@ -58,7 +58,7 @@ app.include_router(admin_router)           # /admin/...
 class ChatRequest(BaseModel):
     user_id: Optional[str] = None
     message: str
-    conversation_id: int = None  # Frontend can optionally pass this
+    conversation_id: Optional[int] = None # Frontend can optionally pass this
 
 
 # ============================================
@@ -165,7 +165,7 @@ async def chat(request: ChatRequest):
     try:
         # Get or create active conversation
         user_id = request.user_id or f"guest_{uuid4().hex[:8]}"
-        active_conv = ensure_active_conversation(request.user_id)
+        active_conv = ensure_active_conversation(user_id)
         conversation_id = active_conv['id']
 
         # Store user message → linked to conversation
