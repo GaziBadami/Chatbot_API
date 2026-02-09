@@ -18,6 +18,8 @@ import fitz  # PyMuPDF
 import base64
 from uuid import uuid4
 from docx import Document
+from uuid import uuid4
+from typing import Optional
 from spire.doc import Document as SpireDocument
 
 # Import routers
@@ -54,7 +56,7 @@ app.include_router(admin_router)           # /admin/...
 # ============================================
 
 class ChatRequest(BaseModel):
-    user_id: str
+    user_id: Optional[str] = None
     message: str
     conversation_id: int = None  # Frontend can optionally pass this
 
@@ -162,6 +164,7 @@ async def chat(request: ChatRequest):
     """
     try:
         # Get or create active conversation
+        user_id = request.user_id or f"guest_{uuid4().hex[:8]}"
         active_conv = ensure_active_conversation(request.user_id)
         conversation_id = active_conv['id']
 
@@ -169,13 +172,13 @@ async def chat(request: ChatRequest):
         store_message(request.user_id, "user", request.message, conversation_id)
 
         # Get history from THIS conversation only
-        history = get_chat_history(request.user_id, conversation_id=conversation_id, limit=15)
+        history = get_chat_history(user_id, conversation_id=conversation_id, limit=15)
 
         # Get AI response
         ai_reply = get_ai_response(request.message, history)
 
         # Store AI reply → linked to conversation
-        store_message(request.user_id, "assistant", ai_reply, conversation_id)
+        store_message(user_id, "assistant", ai_reply, conversation_id)
 
         # Auto-label: if label is still "New Chat", generate a title
         # Only runs once per conversation (when label is default)
@@ -186,10 +189,12 @@ async def chat(request: ChatRequest):
         return {
             "status": "success",
             "reply": ai_reply,
-            "conversation_id": conversation_id
+            "conversation_id": conversation_id,
+            "user_id": user_id
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print("CHAT ERROR:", e)
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 # ============================================
