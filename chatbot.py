@@ -1,14 +1,17 @@
-# Logic for Groq AI (The "Masking" layer with Vision Support)
 import os
 import base64
 from groq import Groq
 from dotenv import load_dotenv
 
-# Load variables
 load_dotenv()
 
-# Initialize Groq client
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# Define models at module level
+VISION_MODELS = [
+    "llama-3.2-90b-vision-preview",  # Use actual Groq vision model
+]
+TEXT_MODEL = "llama-3.3-70b-versatile"
 
 def encode_image(image_path):
     """Helper to encode local images to base64 for the Vision API."""
@@ -19,17 +22,7 @@ def encode_image(image_path):
         print(f"Error encoding image: {e}")
         return None
 
-# chatbot.py
-
 def get_ai_response(user_message, history):
-    VISION_MODELS = [
-        "meta-llama/llama-4-scout-17b-16e-instruct", 
-        "meta-llama/llama-4-maverick-17b-128e-instruct"
-    ]
-    # Keep your fallback model as is
-    TEXT_MODEL = "llama-3.3-70b-versatile"
-    
-
     try:
         has_image = False
         processed_messages = []
@@ -69,11 +62,9 @@ def get_ai_response(user_message, history):
         processed_messages.append({"role": "user", "content": user_message})
 
         # 4. Final Formatting for API
-        # If has_image is True, ALL messages must use the block format (list of dicts)
         final_messages = [{"role": "system", "content": system_content}]
         for m in processed_messages:
             if has_image:
-                # Convert the plain text strings into a list-block format for Vision compatibility
                 if isinstance(m["content"], str):
                     final_messages.append({
                         "role": m["role"],
@@ -84,7 +75,7 @@ def get_ai_response(user_message, history):
             else:
                 final_messages.append(m)
 
-        # 5. attempt API Call with the Vision Models first if the image exists
+        # 5. Use vision model if image exists
         if has_image:
             for model_name in VISION_MODELS:
                 try:
@@ -97,15 +88,13 @@ def get_ai_response(user_message, history):
                     return response.choices[0].message.content
                 except Exception as e:
                     print(f"Vision model {model_name} failed: {e}")
-                    continue # Try next vision model
+                    continue
 
-        # 6. Fallback to Text Model (or default if no image) 
-        # ensures that the messages are back to the string format for text-only models
+        # 6. Fallback to Text Model
         text_messages = [{"role": "system", "content": system_content}]
         for m in processed_messages:
             content = m["content"]
             if isinstance(content, list):
-                # Extract the text from the vision block
                 content = next((item["text"] for item in content if item["type"] == "text"), "")
             text_messages.append({"role": m["role"], "content": content})
 
