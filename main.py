@@ -1,10 +1,10 @@
 """
 main.py
 Core app — /chat, /upload endpoints
-Registers frontend (api.py) and admin (admin_api.py) routers
+Integrates with Finanvo authentication system
 """
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -20,10 +20,11 @@ from uuid import uuid4
 from docx import Document
 from typing import Optional
 from spire.doc import Document as SpireDocument
+import json
 
 # Import routers
-from api import router as conversations_router          # Frontend sidebar routes
-from admin_api import router as admin_router            # Admin routes
+from api import router as conversations_router
+from admin_api import router as admin_router
 
 app = FastAPI(title="Technowire AI Assistant")
 
@@ -46,8 +47,36 @@ app.add_middleware(
 )
 
 # Register routers
-app.include_router(conversations_router)   # /conversations/...
-app.include_router(admin_router)           # /admin/...
+app.include_router(conversations_router)
+app.include_router(admin_router)
+
+
+# ============================================
+# AUTHENTICATION HELPER
+# ============================================
+
+def extract_user_id_from_token(authorization: str) -> str:
+    """
+    Extract user_id from the authorization token.
+    The token is the unique identifier for each user.
+    """
+    if not authorization:
+        raise HTTPException(
+            status_code=401, 
+            detail="Authorization token is required. Please login first."
+        )
+    
+    # Use the token itself as user_id (it's already unique per user)
+    # Clean it up if needed (remove "Bearer " prefix if present)
+    token = authorization.replace("Bearer ", "").strip()
+    
+    if not token:
+        raise HTTPException(
+            status_code=401, 
+            detail="Invalid authorization token."
+        )
+    
+    return token
 
 
 # ============================================
@@ -55,9 +84,8 @@ app.include_router(admin_router)           # /admin/...
 # ============================================
 
 class ChatRequest(BaseModel):
-    user_id: str  # ← REQUIRED - must come from website's token_id/user authentication
     message: str
-    conversation_id: Optional[int] = None  # Frontend can optionally pass this
+    conversation_id: Optional[int] = None
 
 
 # ============================================
@@ -128,12 +156,10 @@ def generate_chat_label(user_message: str, ai_reply: str) -> str:
         )
 
         label = response.choices[0].message.content.strip()
-        # Safety: if Groq returns something too long, truncate
         return label[:50] if label else user_message[:40]
 
     except Exception as e:
         print(f"Auto-label generation failed: {e}")
-        # Fallback: use first 40 chars of user message
         return user_message[:40]
 
 
@@ -151,30 +177,21 @@ async def root():
 # ============================================
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
+async def chat(
+    request: ChatRequest,
+    authorization: Optional[str] = Header(None)
+):
     """
-    Main chat endpoint
-    Flow:
-    1. Ensure active conversation exists FOR THIS SPECIFIC USER
-    2. Store user message with conversation_id
-    3. Get AI reply using THIS USER's history
-    4. Store AI reply with conversation_id
-    5. Auto-generate label if still 'New Chat'
+    Main chat endpoint - Authenticated
     
-    CRITICAL: user_id MUST be sent from the website (token_id or unique user identifier)
+    Requires Authorization header with the user's token from Finanvo login.
+    Each user gets isolated conversations based on their unique token.
     """
     try:
-        # Use the user_id from request (should come from website's authentication)
-        user_id = request.user_id
+        # Extract user_id from Authorization header
+        user_id = extract_user_id_from_token(authorization)
         
-        # Validate user_id is provided
-        if not user_id or user_id.strip() == "":
-            raise HTTPException(
-                status_code=400, 
-                detail="user_id is required. Please provide a valid user identifier."
-            )
-        
-        print(f"[CHAT] User: {user_id}, Message: {request.message[:50]}...")
+        print(f"[CHAT] User Token: {user_id[:20]}..., Message: {request.message[:50]}...")
         
         # Get or create active conversation FOR THIS USER ONLY
         active_conv = ensure_active_conversation(user_id)
@@ -188,7 +205,7 @@ async def chat(request: ChatRequest):
         conversation_id = active_conv['id']
         print(f"[CHAT] Conversation ID: {conversation_id}")
 
-        # Store user message → linked to THIS USER's conversation
+        # Store user message
         store_message(user_id, "user", request.message, conversation_id)
 
         # Get history from THIS USER's conversation only
@@ -198,11 +215,10 @@ async def chat(request: ChatRequest):
         # Get AI response
         ai_reply = get_ai_response(request.message, history)
 
-        # Store AI reply → linked to THIS USER's conversation
+        # Store AI reply
         store_message(user_id, "assistant", ai_reply, conversation_id)
 
-        # Auto-label: if label is still "New Chat", generate a title
-        # Only runs once per conversation (when label is default)
+        # Auto-label
         if active_conv.get('label') == 'New Chat':
             new_label = generate_chat_label(request.message, ai_reply)
             update_label_if_default(conversation_id, new_label)
@@ -212,7 +228,7 @@ async def chat(request: ChatRequest):
             "status": "success",
             "reply": ai_reply,
             "conversation_id": conversation_id,
-            "user_id": user_id
+            "user_id": user_id[:20] + "..."  # Return partial token for privacy
         }
         
     except HTTPException:
@@ -229,22 +245,21 @@ async def chat(request: ChatRequest):
 # ============================================
 
 @app.post("/upload")
-async def upload_file(user_id: str = Form(...), file: UploadFile = File(...)):
+async def upload_file(
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None)
+):
     """
-    File upload endpoint
-    Stores file context as a message linked to active conversation
+    File upload endpoint - Authenticated
     
-    CRITICAL: user_id MUST be sent from the website (token_id or unique user identifier)
+    Requires Authorization header with the user's token from Finanvo login.
+    Stores file context as a message linked to user's active conversation.
     """
     try:
-        # Validate user_id
-        if not user_id or user_id.strip() == "":
-            raise HTTPException(
-                status_code=400, 
-                detail="user_id is required for file upload."
-            )
+        # Extract user_id from Authorization header
+        user_id = extract_user_id_from_token(authorization)
         
-        print(f"[UPLOAD] User: {user_id}, File: {file.filename}")
+        print(f"[UPLOAD] User Token: {user_id[:20]}..., File: {file.filename}")
         
         # Ensure active conversation FOR THIS USER
         active_conv = ensure_active_conversation(user_id)
@@ -264,7 +279,6 @@ async def upload_file(user_id: str = Form(...), file: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Use the deployed URL instead of localhost
         file_url = f"https://chatbot-api-dtad.onrender.com/uploads/{unique_filename}"
 
         # --- PDF ---
@@ -303,7 +317,6 @@ async def upload_file(user_id: str = Form(...), file: UploadFile = File(...)):
             "status": "success",
             "file_url": file_url,
             "conversation_id": conversation_id,
-            "user_id": user_id,
             "message": f"I've received {file.filename}. Note: If I can't see the image content yet, please describe what you need me to analyze in it!"
         }
         
@@ -317,7 +330,7 @@ async def upload_file(user_id: str = Form(...), file: UploadFile = File(...)):
 
 
 # ============================================
-# DEBUG ENDPOINT (Optional - for testing)
+# DEBUG ENDPOINT (Optional)
 # ============================================
 
 @app.get("/test-db")
@@ -355,4 +368,4 @@ async def test_db():
 # ============================================
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)  # Changed to 0.0.0.0 for deployment
+    uvicorn.run(app, host="0.0.0.0", port=8000)
