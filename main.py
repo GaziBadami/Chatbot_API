@@ -18,7 +18,6 @@ import fitz  # PyMuPDF
 import base64
 from uuid import uuid4
 from docx import Document
-from uuid import uuid4
 from typing import Optional
 from spire.doc import Document as SpireDocument
 
@@ -56,9 +55,9 @@ app.include_router(admin_router)           # /admin/...
 # ============================================
 
 class ChatRequest(BaseModel):
-    user_id: Optional[str] = None
+    user_id: str  # ← REQUIRED - must come from website's token_id/user authentication
     message: str
-    conversation_id: Optional[int] = None # Frontend can optionally pass this
+    conversation_id: Optional[int] = None  # Frontend can optionally pass this
 
 
 # ============================================
@@ -156,28 +155,50 @@ async def chat(request: ChatRequest):
     """
     Main chat endpoint
     Flow:
-    1. Ensure active conversation exists
+    1. Ensure active conversation exists FOR THIS SPECIFIC USER
     2. Store user message with conversation_id
-    3. Get AI reply
+    3. Get AI reply using THIS USER's history
     4. Store AI reply with conversation_id
     5. Auto-generate label if still 'New Chat'
+    
+    CRITICAL: user_id MUST be sent from the website (token_id or unique user identifier)
     """
     try:
-        # Get or create active conversation
-        user_id = request.user_id or f"guest_{uuid4().hex[:8]}"
+        # Use the user_id from request (should come from website's authentication)
+        user_id = request.user_id
+        
+        # Validate user_id is provided
+        if not user_id or user_id.strip() == "":
+            raise HTTPException(
+                status_code=400, 
+                detail="user_id is required. Please provide a valid user identifier."
+            )
+        
+        print(f"[CHAT] User: {user_id}, Message: {request.message[:50]}...")
+        
+        # Get or create active conversation FOR THIS USER ONLY
         active_conv = ensure_active_conversation(user_id)
+        
+        if not active_conv:
+            raise HTTPException(
+                status_code=503, 
+                detail="Database connection failed. Please try again later."
+            )
+        
         conversation_id = active_conv['id']
+        print(f"[CHAT] Conversation ID: {conversation_id}")
 
-        # Store user message → linked to conversation
-        store_message(request.user_id, "user", request.message, conversation_id)
+        # Store user message → linked to THIS USER's conversation
+        store_message(user_id, "user", request.message, conversation_id)
 
-        # Get history from THIS conversation only
+        # Get history from THIS USER's conversation only
         history = get_chat_history(user_id, conversation_id=conversation_id, limit=15)
+        print(f"[CHAT] History length: {len(history)}")
 
         # Get AI response
         ai_reply = get_ai_response(request.message, history)
 
-        # Store AI reply → linked to conversation
+        # Store AI reply → linked to THIS USER's conversation
         store_message(user_id, "assistant", ai_reply, conversation_id)
 
         # Auto-label: if label is still "New Chat", generate a title
@@ -185,6 +206,7 @@ async def chat(request: ChatRequest):
         if active_conv.get('label') == 'New Chat':
             new_label = generate_chat_label(request.message, ai_reply)
             update_label_if_default(conversation_id, new_label)
+            print(f"[CHAT] Auto-labeled: {new_label}")
 
         return {
             "status": "success",
@@ -192,9 +214,14 @@ async def chat(request: ChatRequest):
             "conversation_id": conversation_id,
             "user_id": user_id
         }
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        print("CHAT ERROR:", e)
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        print(f"[CHAT ERROR] {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 
 # ============================================
@@ -206,10 +233,28 @@ async def upload_file(user_id: str = Form(...), file: UploadFile = File(...)):
     """
     File upload endpoint
     Stores file context as a message linked to active conversation
+    
+    CRITICAL: user_id MUST be sent from the website (token_id or unique user identifier)
     """
     try:
-        # Ensure active conversation
+        # Validate user_id
+        if not user_id or user_id.strip() == "":
+            raise HTTPException(
+                status_code=400, 
+                detail="user_id is required for file upload."
+            )
+        
+        print(f"[UPLOAD] User: {user_id}, File: {file.filename}")
+        
+        # Ensure active conversation FOR THIS USER
         active_conv = ensure_active_conversation(user_id)
+        
+        if not active_conv:
+            raise HTTPException(
+                status_code=503, 
+                detail="Database connection failed. Please try again later."
+            )
+        
         conversation_id = active_conv['id']
 
         file_extension = os.path.splitext(file.filename)[1].lower()
@@ -219,7 +264,8 @@ async def upload_file(user_id: str = Form(...), file: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        file_url = f"http://127.0.0.1:8000/uploads/{unique_filename}"
+        # Use the deployed URL instead of localhost
+        file_url = f"https://chatbot-api-dtad.onrender.com/uploads/{unique_filename}"
 
         # --- PDF ---
         if file_extension == ".pdf":
@@ -257,10 +303,51 @@ async def upload_file(user_id: str = Form(...), file: UploadFile = File(...)):
             "status": "success",
             "file_url": file_url,
             "conversation_id": conversation_id,
+            "user_id": user_id,
             "message": f"I've received {file.filename}. Note: If I can't see the image content yet, please describe what you need me to analyze in it!"
         }
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"[UPLOAD ERROR] {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+
+# ============================================
+# DEBUG ENDPOINT (Optional - for testing)
+# ============================================
+
+@app.get("/test-db")
+async def test_db():
+    """Test database connection"""
+    from database import get_db_connection
+    
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 as test")
+            result = cursor.fetchone()
+            cursor.close()
+            conn.close()
+            return {
+                "status": "success", 
+                "message": "Database connected successfully!", 
+                "test_query": result
+            }
+        except Exception as e:
+            return {
+                "status": "error", 
+                "message": f"Query failed: {str(e)}"
+            }
+    else:
+        return {
+            "status": "error", 
+            "message": "Database connection failed"
+        }
 
 
 # ============================================
@@ -268,4 +355,4 @@ async def upload_file(user_id: str = Form(...), file: UploadFile = File(...)):
 # ============================================
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)  # Changed to 0.0.0.0 for deployment
